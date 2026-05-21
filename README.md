@@ -1,0 +1,2 @@
+# RIS_literature_review
+读取endnote、web of science和zotero导出的ris格式文献组，调用deepseek V4 pro读取文献输出两个markdown（包含文献卡片和文献分类）和一个文献整理的excel
