@@ -1,0 +1,16 @@
+{
+  "provider": "deepseek",
+  "api_key": "sk-your-deepseek-api-key",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-v4-pro",
+  "endpoint": "chat_completions",
+  "temperature": 0.2,
+  "max_tokens": 2200,
+  "timeout_seconds": 180,
+  "sleep_seconds": 0.2,
+  "json_mode": true,
+  "thinking": {
+    "type": "enabled"
+  },
+  "reasoning_effort": "high"
+}
