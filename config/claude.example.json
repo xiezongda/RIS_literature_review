@@ -1,0 +1,12 @@
+{
+  "provider": "anthropic",
+  "api_key": "sk-ant-your-claude-api-key",
+  "base_url": "https://api.anthropic.com",
+  "model": "claude-3-5-sonnet-latest",
+  "endpoint": "anthropic_messages",
+  "temperature": 0.2,
+  "max_tokens": 2200,
+  "timeout_seconds": 180,
+  "sleep_seconds": 0.2,
+  "anthropic_version": "2023-06-01"
+}

@@ -19,6 +19,9 @@ ENV/
 .env.*
 !.env.example
 config/deepseek_v4pro.json
+config/chatgpt.json
+config/claude.json
+config/agent_config.json
 
 # Raw private literature exports
 data/raw/*
