@@ -40,5 +40,5 @@ Thumbs.db
 *.log
 
 #prompts
-prompts/review_template.md
-prompts/summary_template.md
+propmts/review_template.md
+propmts/summary_template.md
