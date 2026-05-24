@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from AI_agent import extract_json_object, extract_response_text, post_llm_json
@@ -21,6 +21,11 @@ GROUP_CLASSIFICATION_CACHE_PATH = CACHE_DIR / "literature_group_classification.j
 GROUP_CLASSIFICATION_DEBUG_PATH = CACHE_DIR / "literature_group_classification_last_response.json"
 CLASSIFICATION_FIELDS = ("broad_direction", "medium_direction", "small_direction")
 DEFAULT_GROUP_MAX_TOKENS = 6000
+DEFAULT_GROUP_BATCH_SIZE = 25
+DEFAULT_GROUP_MAX_INPUT_CHARS = 60000
+DEFAULT_GROUP_RECORD_ABSTRACT_CHARS = 300
+DEFAULT_GROUP_MAX_TAXONOMY_ITEMS = 40
+DEFAULT_GROUP_MERGE_SIZE = 8
 
 
 def prepare_classification_scheme(
@@ -52,9 +57,16 @@ def prepare_classification_scheme(
             print("未检测到可用 API key；无法生成文献组 AI 分类体系，分类将标记为 AI未分类。")
         return {}
 
-    print("正在让 AI 根据当前研究主题和整组文献生成分类体系...")
+    mode = group_classification_mode(records, fields)
+    if mode == "batch":
+        print("正在使用大文献组模式：分批归纳文献分类体系，再合并为全局分类体系...")
+    else:
+        print("正在让 AI 根据当前研究主题和整组文献生成分类体系...")
     try:
-        scheme = annotate_group_classification(records, fields, llm_config)
+        if mode == "batch":
+            scheme = annotate_large_group_classification(records, fields, llm_config, cache)
+        else:
+            scheme = annotate_group_classification(records, fields, llm_config)
     except Exception as exc:
         print(f"AI 文献组分类体系生成失败，分类将标记为 AI未分类：{exc}")
         return {}
@@ -75,11 +87,11 @@ def classification_fields(fields: list[str]) -> list[str]:
 
 def load_classification_cache() -> dict[str, Any]:
     if not GROUP_CLASSIFICATION_CACHE_PATH.exists():
-        return {"version": 1, "schemes": {}}
+        return {"version": 2, "schemes": {}, "batch_schemes": {}}
     try:
         return json.loads(GROUP_CLASSIFICATION_CACHE_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return {"version": 1, "schemes": {}}
+        return {"version": 2, "schemes": {}, "batch_schemes": {}}
 
 
 def save_classification_cache(cache: dict[str, Any]) -> None:
@@ -89,8 +101,21 @@ def save_classification_cache(cache: dict[str, Any]) -> None:
 
 def classification_cache_key(records: list[LiteratureRecord], fields: list[str]) -> str:
     record_material = "\n\n".join(record_digest(record) for record in records)
-    material = "\n\n".join([template_signature(fields), record_material])
+    material = "\n\n".join([classification_settings_signature(), template_signature(fields), record_material])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def classification_settings_signature() -> str:
+    settings = {
+        "version": "group-classification-v2",
+        "mode": os.getenv("LITERATURE_GROUP_MODE", "auto").strip().lower() or "auto",
+        "batch_size": group_batch_size(),
+        "max_input_chars": group_max_input_chars(),
+        "record_abstract_chars": group_record_abstract_chars(),
+        "max_taxonomy_items": group_max_taxonomy_items(),
+        "merge_size": group_merge_size(),
+    }
+    return json.dumps(settings, ensure_ascii=False, sort_keys=True)
 
 
 def record_digest(record: LiteratureRecord) -> str:
@@ -106,21 +131,209 @@ def record_digest(record: LiteratureRecord) -> str:
     )
 
 
+def group_classification_mode(records: list[LiteratureRecord], fields: list[str]) -> str:
+    mode = os.getenv("LITERATURE_GROUP_MODE", "auto").strip().lower()
+    if mode in {"single", "legacy", "once", "one"}:
+        return "single"
+    if mode in {"batch", "large", "chunk", "chunked"}:
+        return "batch"
+    if mode and mode != "auto":
+        print(f"未知 LITERATURE_GROUP_MODE={mode}，已按 auto 处理。")
+
+    if len(records) > group_batch_size():
+        return "batch"
+    if estimate_group_prompt_chars(records, fields) > group_max_input_chars():
+        return "batch"
+    return "single"
+
+
+def estimate_group_prompt_chars(records: list[LiteratureRecord], fields: list[str]) -> int:
+    base = len(build_group_classification_instructions()) + 1200 + 20 * len(fields)
+    record_chars = sum(len(format_record_for_group_prompt(index, record)) for index, record in enumerate(records, start=1))
+    return base + record_chars
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        print(f"环境变量 {name}={value} 不是整数，已使用默认值 {default}。")
+        return default
+    return max(parsed, minimum)
+
+
+def group_batch_size() -> int:
+    return env_int("LITERATURE_GROUP_BATCH_SIZE", DEFAULT_GROUP_BATCH_SIZE, minimum=1)
+
+
+def group_max_input_chars() -> int:
+    return env_int("LITERATURE_GROUP_MAX_INPUT_CHARS", DEFAULT_GROUP_MAX_INPUT_CHARS, minimum=8000)
+
+
+def group_record_abstract_chars() -> int:
+    return env_int("LITERATURE_GROUP_RECORD_ABSTRACT_CHARS", DEFAULT_GROUP_RECORD_ABSTRACT_CHARS, minimum=80)
+
+
+def group_max_taxonomy_items() -> int:
+    return env_int("LITERATURE_GROUP_MAX_TAXONOMY_ITEMS", DEFAULT_GROUP_MAX_TAXONOMY_ITEMS, minimum=5)
+
+
+def group_merge_size() -> int:
+    return env_int("LITERATURE_GROUP_MERGE_SIZE", DEFAULT_GROUP_MERGE_SIZE, minimum=2)
+
+
+def annotate_large_group_classification(
+    records: list[LiteratureRecord],
+    fields: list[str],
+    config: dict[str, Any],
+    cache: dict[str, Any],
+) -> dict[str, Any]:
+    indexed_records = list(enumerate(records, start=1))
+    batches = split_group_batches(indexed_records, fields)
+    print(
+        f"大文献组模式：{len(records)} 篇文献拆为 {len(batches)} 批，"
+        f"每批最多 {group_batch_size()} 篇。"
+    )
+
+    batch_cache = cache.setdefault("batch_schemes", {})
+    refresh_ai = os.getenv("LITERATURE_REFRESH_AI", "").strip() == "1"
+    batch_schemes: list[dict[str, Any]] = []
+    for batch_number, batch in enumerate(batches, start=1):
+        batch_key = classification_batch_cache_key(batch, fields)
+        cached = normalize_classification_scheme(batch_cache.get(batch_key), classification_fields(fields)) if not refresh_ai else {}
+        if cached:
+            print(f"已加载第 {batch_number}/{len(batches)} 批局部分类：{len(cached.get('taxonomy', []))} 个分类")
+            batch_schemes.append(cached)
+            continue
+
+        first_index, last_index = batch[0][0], batch[-1][0]
+        print(f"正在生成第 {batch_number}/{len(batches)} 批局部分类：文献 {first_index}-{last_index}")
+        prompt = build_group_classification_prompt_from_indexed_records(
+            batch,
+            fields,
+            abstract_chars=group_record_abstract_chars(),
+            task_name="请阅读下面这一批 RIS 文献题录，先生成这批文献的局部分类体系。",
+        )
+        scheme = annotate_classification_prompt(prompt, fields, config)
+        batch_cache[batch_key] = {
+            "source": str(config.get("provider", "llm")),
+            "model": config.get("model", ""),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "record_indices": [index for index, _record in batch],
+            "scheme": scheme,
+        }
+        batch_schemes.append(scheme)
+        save_classification_cache(cache)
+        time.sleep(float(config.get("sleep_seconds", 0.2)))
+
+    return merge_classification_schemes(batch_schemes, fields, config)
+
+
+def split_group_batches(
+    indexed_records: list[tuple[int, LiteratureRecord]],
+    fields: list[str],
+) -> list[list[tuple[int, LiteratureRecord]]]:
+    max_records = group_batch_size()
+    max_chars = group_max_input_chars()
+    abstract_chars = group_record_abstract_chars()
+    overhead = len(build_group_classification_prompt_from_indexed_records([], fields, abstract_chars=abstract_chars))
+    batches: list[list[tuple[int, LiteratureRecord]]] = []
+    current: list[tuple[int, LiteratureRecord]] = []
+    current_chars = overhead
+
+    for index, record in indexed_records:
+        record_chars = len(format_record_for_group_prompt(index, record, abstract_chars=abstract_chars)) + 2
+        would_exceed_count = len(current) >= max_records
+        would_exceed_chars = current and current_chars + record_chars > max_chars
+        if would_exceed_count or would_exceed_chars:
+            batches.append(current)
+            current = []
+            current_chars = overhead
+        current.append((index, record))
+        current_chars += record_chars
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def classification_batch_cache_key(indexed_records: list[tuple[int, LiteratureRecord]], fields: list[str]) -> str:
+    record_material = "\n\n".join(f"{index}\n{record_digest(record)}" for index, record in indexed_records)
+    material = "\n\n".join(
+        [
+            "batch-classification-v1",
+            classification_settings_signature(),
+            template_signature(fields),
+            record_material,
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def merge_classification_schemes(
+    schemes: list[dict[str, Any]],
+    fields: list[str],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    requested_fields = classification_fields(fields)
+    active = [normalize_classification_scheme(scheme, requested_fields) for scheme in schemes]
+    active = [scheme for scheme in active if scheme]
+    if not active:
+        return {}
+    if len(active) == 1:
+        return active[0]
+
+    round_number = 1
+    merge_size = group_merge_size()
+    while len(active) > 1:
+        merged_round: list[dict[str, Any]] = []
+        groups = list(chunk_list(active, merge_size))
+        for group_number, group in enumerate(groups, start=1):
+            if len(group) == 1:
+                merged_round.append(group[0])
+                continue
+            print(f"正在合并第 {round_number} 轮分类体系：{group_number}/{len(groups)}")
+            prompt = build_merge_classification_prompt(group, fields)
+            merged = annotate_classification_prompt(prompt, fields, config, schema_name="literature_group_classification_merge")
+            merged_round.append(merged)
+            time.sleep(float(config.get("sleep_seconds", 0.2)))
+        active = merged_round
+        round_number += 1
+    return active[0]
+
+
+def chunk_list(values: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
 def annotate_group_classification(
     records: list[LiteratureRecord],
     fields: list[str],
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    prompt = build_group_classification_prompt(records, fields)
+    return annotate_classification_prompt(prompt, fields, config)
+
+
+def annotate_classification_prompt(
+    prompt: str,
+    fields: list[str],
+    config: dict[str, Any],
+    schema_name: str = "literature_group_classification",
+) -> dict[str, Any]:
     endpoint_type = str(config.get("endpoint", "chat_completions"))
     if endpoint_type == "responses":
-        return annotate_group_with_responses_api(records, fields, config)
+        return annotate_group_with_responses_api(prompt, fields, config, schema_name)
     if endpoint_type == "anthropic_messages":
-        return annotate_group_with_anthropic_messages(records, fields, config)
-    return annotate_group_with_chat_completions(records, fields, config)
+        return annotate_group_with_anthropic_messages(prompt, fields, config)
+    return annotate_group_with_chat_completions(prompt, fields, config)
 
 
 def annotate_group_with_chat_completions(
-    records: list[LiteratureRecord],
+    prompt: str,
     fields: list[str],
     config: dict[str, Any],
 ) -> dict[str, Any]:
@@ -129,7 +342,7 @@ def annotate_group_with_chat_completions(
         "model": config.get("model", "deepseek-v4-pro"),
         "messages": [
             {"role": "system", "content": build_group_classification_instructions()},
-            {"role": "user", "content": build_group_classification_prompt(records, fields)},
+            {"role": "user", "content": prompt},
         ],
         "temperature": float(config.get("temperature", 0.2)),
         "max_tokens": group_max_tokens(config),
@@ -147,23 +360,24 @@ def annotate_group_with_chat_completions(
         return parse_classification_response(content, fields)
     except Exception as exc:
         save_group_classification_debug(data, content, exc)
-        return retry_group_classification_json(endpoint, payload, records, fields, config, content, exc)
+        return retry_group_classification_json(endpoint, payload, prompt, fields, config, content, exc)
 
 
 def annotate_group_with_responses_api(
-    records: list[LiteratureRecord],
+    prompt: str,
     fields: list[str],
     config: dict[str, Any],
+    schema_name: str = "literature_group_classification",
 ) -> dict[str, Any]:
     endpoint = str(config.get("base_url", "https://api.openai.com/v1")).rstrip("/") + "/responses"
     payload = {
         "model": config.get("model", "gpt-4o-mini"),
         "instructions": build_group_classification_instructions(),
-        "input": build_group_classification_prompt(records, fields),
+        "input": prompt,
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "literature_group_classification",
+                "name": schema_name,
                 "strict": True,
                 "schema": classification_json_schema(fields),
             }
@@ -181,7 +395,7 @@ def annotate_group_with_responses_api(
 
 
 def annotate_group_with_anthropic_messages(
-    records: list[LiteratureRecord],
+    prompt: str,
     fields: list[str],
     config: dict[str, Any],
 ) -> dict[str, Any]:
@@ -189,7 +403,7 @@ def annotate_group_with_anthropic_messages(
     payload: dict[str, Any] = {
         "model": config.get("model", "claude-3-5-sonnet-latest"),
         "system": build_group_classification_instructions(),
-        "messages": [{"role": "user", "content": build_group_classification_prompt(records, fields)}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": float(config.get("temperature", 0.2)),
         "max_tokens": group_max_tokens(config),
     }
@@ -231,7 +445,7 @@ def chat_message_text(data: dict[str, Any]) -> str:
 def retry_group_classification_json(
     endpoint: str,
     payload: dict[str, Any],
-    records: list[LiteratureRecord],
+    source_prompt: str,
     fields: list[str],
     config: dict[str, Any],
     previous_text: str,
@@ -248,7 +462,7 @@ def retry_group_classification_json(
         },
         {
             "role": "user",
-            "content": build_group_classification_retry_prompt(records, fields, previous_text, previous_error),
+            "content": build_group_classification_retry_prompt(source_prompt, fields, previous_text, previous_error),
         },
     ]
     data = post_llm_json(endpoint, retry_payload, config)
@@ -275,13 +489,23 @@ def build_group_classification_instructions() -> str:
 
 
 def build_group_classification_prompt(records: list[LiteratureRecord], fields: list[str]) -> str:
+    return build_group_classification_prompt_from_indexed_records(list(enumerate(records, start=1)), fields)
+
+
+def build_group_classification_prompt_from_indexed_records(
+    indexed_records: list[tuple[int, LiteratureRecord]],
+    fields: list[str],
+    abstract_chars: int = 600,
+    task_name: str = "请阅读下面这一组 RIS 文献题录，围绕 AI_READING_PROMPT 中的研究主题，自动生成后续逐篇文献标注要使用的分类体系。",
+) -> str:
     requested_fields = classification_fields(fields)
     field_text = "、".join(requested_fields)
     example_fields = {field: "..." for field in requested_fields}
     example_fields.update({"description": "...", "representative_indices": ["1", "2"]})
     return "\n".join(
         [
-            "请阅读下面这一组 RIS 文献题录，围绕 AI_READING_PROMPT 中的研究主题，自动生成后续逐篇文献标注要使用的分类体系。",
+            task_name,
+            "分类必须围绕 AI_READING_PROMPT 中的研究主题，并服务于后续逐篇文献标注。",
             f"分类字段：{field_text}",
             "",
             "要求：",
@@ -295,13 +519,50 @@ def build_group_classification_prompt(records: list[LiteratureRecord], fields: l
             json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
             "",
             "文献组：",
-            *[format_record_for_group_prompt(index, record) for index, record in enumerate(records, start=1)],
+            *[
+                format_record_for_group_prompt(index, record, abstract_chars=abstract_chars)
+                for index, record in indexed_records
+            ],
+        ]
+    )
+
+
+def build_merge_classification_prompt(schemes: list[dict[str, Any]], fields: list[str]) -> str:
+    requested_fields = classification_fields(fields)
+    field_text = "、".join(requested_fields)
+    example_fields = {field: "..." for field in requested_fields}
+    example_fields.update({"description": "...", "representative_indices": ["1", "2"]})
+    merge_payload = [
+        {
+            "source": f"batch_or_round_{index}",
+            "taxonomy": scheme.get("taxonomy", []),
+        }
+        for index, scheme in enumerate(schemes, start=1)
+    ]
+    return "\n".join(
+        [
+            "下面是若干批文献已经生成的局部分类体系。请将它们合并成一个全局分类体系，供后续所有文献逐篇标注使用。",
+            f"分类字段：{field_text}",
+            f"全局 taxonomy 建议不超过 {group_max_taxonomy_items()} 个叶子分类；如果局部分类语义相近，请合并并统一命名。",
+            "",
+            "合并要求：",
+            "1. 只合并分类体系，不要重新发明与材料无关的新分类。",
+            "2. 保留能覆盖主要研究脉络的 broad_direction、medium_direction、small_direction 层级。",
+            "3. description 要说明该分类适合归入哪些文献，便于后续逐篇选择。",
+            "4. representative_indices 合并各局部分类中的代表文献序号，保留少量最有代表性的序号即可。",
+            "5. 输出必须是一个合法 JSON 对象，不要输出 Markdown 或解释文字。",
+            "",
+            "请输出 JSON：",
+            json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
+            "",
+            "局部分类体系：",
+            json.dumps(merge_payload, ensure_ascii=False, indent=2),
         ]
     )
 
 
 def build_group_classification_retry_prompt(
-    records: list[LiteratureRecord],
+    source_prompt: str,
     fields: list[str],
     previous_text: str,
     previous_error: Exception,
@@ -321,13 +582,13 @@ def build_group_classification_retry_prompt(
             "JSON 结构必须完全类似：",
             json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
             "",
-            "文献组：",
-            *[format_record_for_group_prompt(index, record) for index, record in enumerate(records, start=1)],
+            "原始任务和材料如下：",
+            source_prompt,
         ]
     )
 
 
-def format_record_for_group_prompt(index: int, record: LiteratureRecord) -> str:
+def format_record_for_group_prompt(index: int, record: LiteratureRecord, abstract_chars: int = 600) -> str:
     return "\n".join(
         [
             f"[{index}]",
@@ -335,7 +596,7 @@ def format_record_for_group_prompt(index: int, record: LiteratureRecord) -> str:
             f"year: {record.year or '未提供'}",
             f"journal: {record.journal or '未提供'}",
             f"keywords: {'; '.join(record.keywords) or '未提供'}",
-            f"abstract: {truncate(record.abstract, 600) or '未提供'}",
+            f"abstract: {truncate(record.abstract, abstract_chars) or '未提供'}",
         ]
     )
 

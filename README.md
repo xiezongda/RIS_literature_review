@@ -188,11 +188,33 @@ $env:LITERATURE_REFRESH_AI="1"
 python src/main.py
 ```
 
-文献组分类会一次性读取整组文献，通常比单篇阅读需要更多输出 token。默认组分类使用 `6000` output tokens；也可以通过环境变量调整：
+文献组分类默认使用 `auto` 模式：小文献组会一次性读取整组文献；当文献数量或 prompt 长度较大时，会自动拆成多批，先生成每批局部分类体系，再合并为全局分类体系，避免 100-200 篇文献一次性塞入模型导致上下文爆掉。默认组分类使用 `6000` output tokens；也可以通过环境变量调整：
 
 ```powershell
 $env:LITERATURE_GROUP_MAX_TOKENS="8000"
 python src/main.py
+```
+
+大文献组相关参数：
+
+```powershell
+# auto：自动判断；single：强制一次性整组分类；batch：强制分批分类
+$env:LITERATURE_GROUP_MODE="auto"
+
+# 每批最多多少篇文献
+$env:LITERATURE_GROUP_BATCH_SIZE="25"
+
+# 每批 prompt 的大致字符预算
+$env:LITERATURE_GROUP_MAX_INPUT_CHARS="60000"
+
+# 大文献组局部分类时，每篇摘要最多放入多少字符
+$env:LITERATURE_GROUP_RECORD_ABSTRACT_CHARS="300"
+
+# 合并全局分类体系时建议保留的最大分类数量
+$env:LITERATURE_GROUP_MAX_TAXONOMY_ITEMS="40"
+
+# 每轮最多合并多少个局部分类体系
+$env:LITERATURE_GROUP_MERGE_SIZE="8"
 ```
 
 如果模型没有返回合法 JSON，程序会自动重试一次严格 JSON 输出，并把最近一次原始响应保存到 `output/cache/literature_group_classification_last_response.json`，便于排查 prompt 或模型返回格式问题。
@@ -211,7 +233,7 @@ output/cache/literature_ai_annotations.json
 output/cache/literature_group_classification.json
 ```
 
-缓存可以减少重复调用 API。缓存签名包含 `review_templete.md`、`sunmary_templete.md` 的关键内容以及当前文献组信息，修改研究主题、字段、分类要求或文献组后，新的模板会生成新的缓存记录。
+缓存可以减少重复调用 API。缓存签名包含 `review_templete.md`、`sunmary_templete.md` 的关键内容、当前文献组信息以及大文献组分批参数；修改研究主题、字段、分类要求、文献组或分批参数后，新的模板会生成新的缓存记录。大文献组模式下，每个 batch 的局部分类也会写入同一个缓存文件，方便断点续跑。
 
 ## GitHub 上传注意
 
