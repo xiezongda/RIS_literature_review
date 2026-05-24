@@ -6,6 +6,7 @@
   "endpoint": "chat_completions",
   "temperature": 0.2,
   "max_tokens": 2200,
+  "group_max_tokens": 6000,
   "timeout_seconds": 180,
   "sleep_seconds": 0.2,
   "json_mode": true,

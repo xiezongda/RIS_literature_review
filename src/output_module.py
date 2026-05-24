@@ -148,19 +148,24 @@ def write_summary(
     if not records:
         lines.extend(["当前没有可分类文献。把 `.ris` 文件放入 `data/raw/` 后运行 `python src/main.py`。", ""])
     else:
-        grouped: dict[str, dict[str, list[tuple[int, LiteratureRecord]]]] = defaultdict(lambda: defaultdict(list))
+        grouped: dict[str, dict[str, dict[str, list[tuple[int, LiteratureRecord]]]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
         for index, record in enumerate(records, start=1):
             analysis = build_analysis(record, fields, annotations.get(index, {}))
-            broad = analysis.get("broad_direction") or "未分类"
-            medium = analysis.get("medium_direction") or "待人工分类"
-            grouped[broad][medium].append((index, record))
+            broad = analysis.get("broad_direction") or "AI未分类"
+            medium = analysis.get("medium_direction") or "待AI分析"
+            small = analysis.get("small_direction") or "未细分"
+            grouped[broad][medium][small].append((index, record))
 
         for broad in sorted(grouped):
             lines.extend([f"## {broad}", ""])
             for medium in sorted(grouped[broad]):
                 lines.extend([f"### {medium}", ""])
-                lines.extend(render_dataview_table(grouped[broad][medium]))
-                lines.append("")
+                for small in sorted(grouped[broad][medium]):
+                    lines.extend([f"#### {small}", ""])
+                    lines.extend(render_dataview_table(grouped[broad][medium][small]))
+                    lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

@@ -10,11 +10,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PROMPTS_DIR = ROOT / "propmts"
 
 REVIEW_TEMPLATE_PATHS = [
+    PROMPTS_DIR / "review_template.md",
     PROMPTS_DIR / "review_templete.md",
     ROOT / "review_templete.md",
     ROOT / "prompts" / "review_template.md",
 ]
 SUMMARY_TEMPLATE_PATHS = [
+    PROMPTS_DIR / "summary_template.md",
     PROMPTS_DIR / "sunmary_templete.md",
     PROMPTS_DIR / "summary_templete.md",
     ROOT / "sunmary_templete.md",
@@ -25,11 +27,12 @@ SUMMARY_TEMPLATE_PATHS = [
 DEFAULT_AI_FIELDS = [
     "broad_direction",
     "medium_direction",
+    "small_direction",
     "abstract_summary",
     "study_object",
     "methods",
     "core_result",
-    "fcva_connection",
+    "research_topic_connection",
     "complexity",
     "review_sentence",
 ]
@@ -105,11 +108,16 @@ def build_ai_instructions() -> str:
     )
 
 
-def build_ai_user_prompt(record_payload: dict[str, str], fields: list[str] | None = None) -> str:
+def build_ai_user_prompt(
+    record_payload: dict[str, str],
+    fields: list[str] | None = None,
+    classification_context: str = "",
+) -> str:
     fields = fields or get_ai_fields()
     descriptions = get_ai_field_descriptions()
     user_prompt = read_review_section("AI_USER_PROMPT", default_ai_user_prompt())
     field_lines = [f"{field}：{descriptions.get(field, '')}".rstrip("：") for field in fields]
+    classification_lines = ["", classification_context] if classification_context else []
     return "\n".join(
         [
             f"文献序号：{record_payload['index']}",
@@ -120,6 +128,7 @@ def build_ai_user_prompt(record_payload: dict[str, str], fields: list[str] | Non
             f"DOI：{record_payload['doi']}",
             f"关键词：{record_payload['keywords']}",
             f"摘要：{record_payload['abstract']}",
+            *classification_lines,
             "",
             user_prompt,
             "",
@@ -143,6 +152,7 @@ def template_signature(fields: list[str]) -> str:
         [
             read_review_section("AI_READING_PROMPT", default_review_ai_prompt()),
             read_review_section("AI_USER_PROMPT", default_ai_user_prompt()),
+            read_summary_section("SUMMARY_PROMPT", default_summary_prompt()),
             get_card_template(),
             "|".join(fields),
         ]
@@ -159,8 +169,8 @@ def render_template(template: str, context: dict[str, Any]) -> str:
 
 def default_review_ai_prompt() -> str:
     return (
-        "你是材料科学与薄膜制备方向的文献综述助手。"
-        "请阅读 RIS 题录字段，为用户指定主题生成中文文献卡片分析。"
+        "你是文献综述助手。"
+        "请阅读 RIS 题录字段，为用户在模板中指定的研究主题生成中文文献卡片分析。"
         "不要编造题录中没有的信息；如果摘要为空，必须明确写“题录缺摘要，需阅读全文验证”。"
     )
 
@@ -172,6 +182,7 @@ def default_ai_user_prompt() -> str:
             "请输出以下字段：",
             "broad_direction：研究大方向，适合综述目录一级分类。",
             "medium_direction：中等方向，适合综述目录二级分类。",
+            "small_direction：小方向，适合综述目录三级分类。",
             "abstract_summary：1 句话概括摘要。",
             "study_object：研究对象。",
             "methods：研究方法。",
@@ -192,6 +203,7 @@ year:: {{year}}
 doi:: {{doi}}
 broad_direction:: {{broad_direction}}
 medium_direction:: {{medium_direction}}
+small_direction:: {{small_direction}}
 
 - 年份：{{year}}
 - 作者：{{authors}}
@@ -202,7 +214,7 @@ medium_direction:: {{medium_direction}}
 - 研究对象：{{study_object}}
 - 研究方法：{{methods}}
 - 核心结果：{{core_result}}
-- 研究主题可结合的点：{{fcva_connection}}
+- 研究主题可结合的点：{{research_topic_connection}}
 - 实验复杂性和可实现性：{{complexity}}
 - 可用于论文综述的句子：{{review_sentence}}
 """
@@ -210,7 +222,7 @@ medium_direction:: {{medium_direction}}
 
 def default_summary_prompt() -> str:
     return (
-        "请将文献按照研究大方向到中等方向分类；分类应适合 Obsidian 总览，"
+        "请将文献按照研究大方向到小方向分类；分类应适合 Obsidian 总览，"
         "并能通过 Dataview 表格链接到 literature_cards.md 中对应文献卡片。"
     )
 
@@ -221,7 +233,7 @@ def default_summary_header_template() -> str:
 > 生成时间：{{generated_at}}
 > 文献数量：{{record_count}}
 
-本文件按“研究大方向 → 中等方向”组织文献。每个分类下的表格由 Obsidian DataviewJS 构建，文献标题链接到 `{{cards_file}}` 中对应卡片。
+本文件按“研究大方向 → 中等方向 → 小方向”组织文献。每个分类下的表格由 Obsidian DataviewJS 构建，文献标题链接到 `{{cards_file}}` 中对应卡片。
 """
 
 

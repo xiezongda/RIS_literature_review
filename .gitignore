@@ -38,3 +38,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+#prompts
+prompts/review_template.md
+prompts/summary_template.md

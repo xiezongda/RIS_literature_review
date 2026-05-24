@@ -8,7 +8,7 @@
 - 解析 `title`、`authors`、`year`、`journal`、`doi`、`keywords`、`abstract`。
 - 兼容 RIS 摘要字段 `AB` 和 `N2`，也兼容 EndNote `%0/%A/%T/%X` 导出格式。
 - 优先按 DOI 去重；无 DOI 时按标题近似去重。
-- 调用配置的 AI agent 阅读每篇文献，生成结构化整理字段。
+- 调用配置的 AI agent 先根据当前研究主题和整组文献生成分类体系，再逐篇阅读文献并生成结构化整理字段。
 - 输出 Excel：`output/excel/literature_records.xlsx`。
 - 输出文献卡片：`output/markdown/literature_cards.md`。
 - 输出 Obsidian + Dataview 分类总结：`output/markdown/literature_summary.md`。
@@ -29,10 +29,13 @@
 │   ├── excel/
 │   └── markdown/
 ├── propmts/
-│   ├── review_templete.md
-│   └── sunmary_templete.md
+│   ├── review_template.md
+│   └── summary_template.md
 ├── src/
 │   ├── main.py
+│   ├── project_paths.py
+│   ├── AI_agent.py
+│   ├── AI_group_classification.py
 │   ├── RIS_analysis.py
 │   ├── remove_duplicates.py
 │   ├── read_templete.py
@@ -150,27 +153,31 @@ output/markdown/literature_cards.md
 output/markdown/literature_summary.md
 ```
 
-如果没有配置 API key，程序仍会运行，并用规则兜底生成基础整理内容；配置 API key 后会调用 AI agent 阅读文献。
+如果没有配置 API key，程序仍会运行，但分类会标记为 `AI未分类/待AI分析`，不会再用 Python 关键词规则硬编码分类；配置 API key 后会调用 AI agent 生成文献组分类体系并逐篇阅读文献。
 
 ## 修改 AI 阅读模板
 
 逐篇文献整理模板：
 
 ```text
-propmts/review_templete.md
+propmts/review_template.md
 ```
 
 分类总结模板：
 
 ```text
-propmts/sunmary_templete.md
+propmts/summary_template.md
 ```
 
-`review_templete.md` 里有三个主要区域：
+`review_template.md` 里有三个主要区域：
 
 - `AI_READING_PROMPT`：控制 AI 阅读文献时的角色、研究主题和判断重点。
 - `AI_USER_PROMPT`：控制 AI 需要输出除了文献序号、标题、作者、年份、期刊、DOI、关键词和摘要这些固定字段之外的其他结构化字段。
 - `CARD_TEMPLATE`：控制 `literature_cards.md` 中每篇文献卡片的 Markdown 样式。
+
+程序会先把整组文献交给 AI，根据 `AI_READING_PROMPT` 中的研究主题自动生成 `broad_direction`、`medium_direction`、`small_direction` 等分类体系。后续逐篇文献阅读会优先从这套 AI 生成的分类体系中选择分类。因此更换研究主题时，只需要修改 `AI_READING_PROMPT`，不用进入 Python 文件手动改分类规则。
+
+为了兼容旧版本，程序也能读取 `review_templete.md`、`sunmary_templete.md` 等历史拼写文件；如果同一目录下新旧文件同时存在，会优先读取 `review_template.md` 和 `summary_template.md`。
 
 如果只想改变 AI 输出字段，请修改 `AI_USER_PROMPT` 中的字段列表，并在 `CARD_TEMPLATE` 中使用同名 `{{field_name}}` 占位符。程序会自动把这些字段同步到 AI 输出要求、Excel 表头和文献卡片渲染中。
 
@@ -181,6 +188,15 @@ $env:LITERATURE_REFRESH_AI="1"
 python src/main.py
 ```
 
+文献组分类会一次性读取整组文献，通常比单篇阅读需要更多输出 token。默认组分类使用 `6000` output tokens；也可以通过环境变量调整：
+
+```powershell
+$env:LITERATURE_GROUP_MAX_TOKENS="8000"
+python src/main.py
+```
+
+如果模型没有返回合法 JSON，程序会自动重试一次严格 JSON 输出，并把最近一次原始响应保存到 `output/cache/literature_group_classification_last_response.json`，便于排查 prompt 或模型返回格式问题。
+
 ## 缓存说明
 
 AI 阅读结果会缓存到：
@@ -189,7 +205,13 @@ AI 阅读结果会缓存到：
 output/cache/literature_ai_annotations.json
 ```
 
-缓存可以减少重复调用 API。缓存签名包含 `review_templete.md` 的关键内容，修改字段或 prompt 后，新的模板会生成新的缓存记录。
+文献组分类体系会缓存到：
+
+```text
+output/cache/literature_group_classification.json
+```
+
+缓存可以减少重复调用 API。缓存签名包含 `review_templete.md`、`sunmary_templete.md` 的关键内容以及当前文献组信息，修改研究主题、字段、分类要求或文献组后，新的模板会生成新的缓存记录。
 
 ## GitHub 上传注意
 
