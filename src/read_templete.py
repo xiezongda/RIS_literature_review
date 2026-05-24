@@ -7,21 +7,13 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROMPTS_DIR = ROOT / "propmts"
+PROMPTS_DIR = ROOT / "prompts"
 
 REVIEW_TEMPLATE_PATHS = [
-    PROMPTS_DIR / "review_template.md",
-    PROMPTS_DIR / "review_templete.md",
-    ROOT / "review_templete.md",
-    ROOT / "prompts" / "review_template.md",
+    PROMPTS_DIR / "review_template.md"
 ]
 SUMMARY_TEMPLATE_PATHS = [
     PROMPTS_DIR / "summary_template.md",
-    PROMPTS_DIR / "sunmary_templete.md",
-    PROMPTS_DIR / "summary_templete.md",
-    ROOT / "sunmary_templete.md",
-    ROOT / "summary_templete.md",
-    ROOT / "prompts" / "summary_template.md",
 ]
 
 DEFAULT_AI_FIELDS = [

@@ -235,14 +235,3 @@ output/cache/literature_group_classification.json
 
 缓存可以减少重复调用 API。缓存签名包含 `review_templete.md`、`sunmary_templete.md` 的关键内容、当前文献组信息以及大文献组分批参数；修改研究主题、字段、分类要求、文献组或分批参数后，新的模板会生成新的缓存记录。大文献组模式下，每个 batch 的局部分类也会写入同一个缓存文件，方便断点续跑。
 
-## GitHub 上传注意
-
-默认 `.gitignore` 会忽略：
-
-- 原始 RIS 文件：`data/raw/*.ris`
-- 输出结果：`output/`
-- API 配置：`config/deepseek_v4pro.json`、`config/chatgpt.json`、`config/claude.json`
-- `.env`
-- Python 缓存和虚拟环境
-
-上传前建议确认没有 API key、未公开文献数据或临时输出被加入暂存区。
