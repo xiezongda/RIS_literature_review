@@ -428,6 +428,10 @@ $env:LITERATURE_GROUP_MAX_TAXONOMY_ITEMS="40"
 
 $env:LITERATURE_GROUP_MERGE_SIZE="8"
 
+# 严格 JSON 分类任务默认不启用 thinking，避免模型把 output token 全用在推理上而不返回 JSON
+
+$env:LITERATURE_GROUP_USE_THINKING="0"
+
 ```
 
   

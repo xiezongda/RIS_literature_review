@@ -22,6 +22,7 @@ from read_templete import (
     analysis_json_schema,
     build_ai_instructions,
     build_ai_user_prompt,
+    get_research_topic,
     template_signature,
 )
 from project_paths import CACHE_DIR
@@ -57,12 +58,14 @@ def prepare_runtime_annotations(
     use_ai = os.getenv("LITERATURE_USE_AI", "1").strip() != "0"
     llm_config = llm_config or load_llm_config()
     api_key = str(llm_config.get("api_key", "")).strip()
-    classification_context = format_classification_scheme(classification_scheme or {}, fields)
-    if not classification_context and classification_fields(fields):
-        classification_context = (
+    base_classification_context = format_classification_scheme(classification_scheme or {}, fields)
+    if not base_classification_context and classification_fields(fields):
+        topic = get_research_topic()
+        base_classification_context = (
             "当前没有可用的文献组 AI 分类体系。"
             "请不要自行创建新的分类名称；分类字段填写 broad_direction=AI未分类，"
             "medium_direction=待AI分析，small_direction=待AI分析。"
+            f"注意：分类失败只影响分类字段；research_topic_connection、complexity、review_sentence 等分析字段仍必须围绕“{topic}”判断，不能只复述文献内容。"
         )
     signature = "\n".join([template_signature(fields), classification_scheme_signature(classification_scheme or {})])
     cache_changed = False
@@ -83,7 +86,18 @@ def prepare_runtime_annotations(
         for position, (index, record, key) in enumerate(missing, start=1):
             print(f"AI 阅读 {position}/{len(missing)}：{record.title[:80] or '未命名文献'}")
             try:
-                analysis = annotate_record_with_llm(index, record, llm_config, fields, classification_context)
+                classification_context = (
+                    format_classification_scheme(classification_scheme or {}, fields, record=record)
+                    if classification_scheme
+                    else base_classification_context
+                )
+                analysis = annotate_record_with_llm(
+                    index,
+                    record,
+                    llm_config,
+                    fields,
+                    classification_context or base_classification_context,
+                )
             except Exception as exc:
                 print(f"AI 阅读失败，改用中性兜底：第 {index} 条，{exc}")
                 analysis = {}
@@ -185,6 +199,18 @@ def annotate_record_with_llm(
     return annotate_record_with_chat_completions(index, record, config, fields, classification_context)
 
 
+def annotation_max_tokens(config: dict[str, Any]) -> int:
+    return int(config.get("annotation_max_tokens", config.get("max_tokens", 2200)))
+
+
+def annotation_thinking(config: dict[str, Any]) -> Any:
+    return config.get("annotation_thinking", config.get("thinking"))
+
+
+def annotation_reasoning_effort(config: dict[str, Any]) -> Any:
+    return config.get("annotation_reasoning_effort", config.get("reasoning_effort"))
+
+
 def record_payload(index: int, record: LiteratureRecord) -> dict[str, str]:
     return {
         "index": str(index),
@@ -213,14 +239,16 @@ def annotate_record_with_chat_completions(
             {"role": "user", "content": build_ai_user_prompt(record_payload(index, record), fields, classification_context)},
         ],
         "temperature": float(config.get("temperature", 0.2)),
-        "max_tokens": int(config.get("max_tokens", 2200)),
+        "max_tokens": annotation_max_tokens(config),
     }
     if config.get("json_mode", True):
         payload["response_format"] = {"type": "json_object"}
-    if config.get("thinking"):
-        payload["thinking"] = config["thinking"]
-    if config.get("reasoning_effort"):
-        payload["reasoning_effort"] = config["reasoning_effort"]
+    thinking = annotation_thinking(config)
+    if thinking:
+        payload["thinking"] = thinking
+    reasoning_effort = annotation_reasoning_effort(config)
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
 
     try:
         data = post_llm_json(endpoint, payload, config)
@@ -254,7 +282,7 @@ def annotate_record_with_responses_api(
             }
         },
         "temperature": float(config.get("temperature", 0.2)),
-        "max_output_tokens": int(config.get("max_tokens", 2200)),
+        "max_output_tokens": annotation_max_tokens(config),
     }
     data = post_llm_json(endpoint, payload, config)
     return parse_analysis_response(extract_response_text(data), fields)
@@ -273,10 +301,11 @@ def annotate_record_with_anthropic_messages(
         "system": build_ai_instructions(),
         "messages": [{"role": "user", "content": build_ai_user_prompt(record_payload(index, record), fields, classification_context)}],
         "temperature": float(config.get("temperature", 0.2)),
-        "max_tokens": int(config.get("max_tokens", 2200)),
+        "max_tokens": annotation_max_tokens(config),
     }
-    if config.get("thinking"):
-        payload["thinking"] = config["thinking"]
+    thinking = annotation_thinking(config)
+    if thinking:
+        payload["thinking"] = thinking
     data = post_llm_json(endpoint, payload, config)
     content = "\n".join(item.get("text", "") for item in data.get("content", []) if item.get("type") == "text")
     return parse_analysis_response(content, fields)

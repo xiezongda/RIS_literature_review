@@ -7,13 +7,22 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROMPTS_DIR = ROOT / "prompts"
+PROMPTS_DIR = ROOT / "propmts"
+LEGACY_PROMPTS_DIR = ROOT / "prompts"
 
 REVIEW_TEMPLATE_PATHS = [
-    PROMPTS_DIR / "review_template.md"
+    PROMPTS_DIR / "review_template.md",
+    PROMPTS_DIR / "review_templete.md",
+    ROOT / "review_templete.md",
+    LEGACY_PROMPTS_DIR / "review_template.md",
 ]
 SUMMARY_TEMPLATE_PATHS = [
     PROMPTS_DIR / "summary_template.md",
+    PROMPTS_DIR / "sunmary_templete.md",
+    PROMPTS_DIR / "summary_templete.md",
+    ROOT / "sunmary_templete.md",
+    ROOT / "summary_templete.md",
+    LEGACY_PROMPTS_DIR / "summary_template.md",
 ]
 
 DEFAULT_AI_FIELDS = [
@@ -87,12 +96,32 @@ def get_dataview_table_template() -> str:
     return read_summary_section("DATAVIEW_TABLE_TEMPLATE", default_dataview_table_template())
 
 
+def get_research_topic() -> str:
+    return extract_research_topic(read_review_section("AI_READING_PROMPT", default_review_ai_prompt()))
+
+
+def extract_research_topic(review_prompt: str) -> str:
+    patterns = (
+        r"研究主题[^“”\"'\n]*(?:聚焦于|是|为|：|:)?\s*[“\"']([^“”\"']+)[”\"']",
+        r"主题聚焦于\s*[“\"']([^“”\"']+)[”\"']",
+        r"聚焦于\s*[“\"']([^“”\"']+)[”\"']",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, review_prompt)
+        if match:
+            return match.group(1).strip()
+    return "AI_READING_PROMPT 中指定的研究主题"
+
+
 def build_ai_instructions() -> str:
     review_prompt = read_review_section("AI_READING_PROMPT", default_review_ai_prompt())
     summary_prompt = read_summary_section("SUMMARY_PROMPT", default_summary_prompt())
+    topic = get_research_topic()
     return "\n\n".join(
         [
             review_prompt,
+            f"当前研究主题：{topic}",
+            "所有分析字段都必须服务于当前研究主题。特别是 research_topic_connection，必须判断文献与当前研究主题的直接关系、间接启发或不相关原因，不能只复述文献内容。",
             "总结文件分类要求如下，生成分类字段时必须服务于该分类逻辑：",
             summary_prompt,
             "输出必须是一个合法 json 对象，不要输出 Markdown 或解释文字。",
@@ -108,7 +137,23 @@ def build_ai_user_prompt(
     fields = fields or get_ai_fields()
     descriptions = get_ai_field_descriptions()
     user_prompt = read_review_section("AI_USER_PROMPT", default_ai_user_prompt())
-    field_lines = [f"{field}：{descriptions.get(field, '')}".rstrip("：") for field in fields]
+    topic = get_research_topic()
+    field_lines = []
+    for field in fields:
+        description = descriptions.get(field, "")
+        if field in {"broad_direction", "medium_direction", "small_direction"}:
+            description = (
+                f"{description} 必须使用中文分类名，优先从文献组分类体系中选择；"
+                "不要输出英文分类名或英文短语。"
+            ).strip()
+        if field == "research_topic_connection":
+            description = (
+                f"必须围绕“{topic}”判断相关性。"
+                f"如果直接相关，说明可用于“{topic}”的哪个问题；"
+                "如果不直接相关，必须写明“不直接相关”，再给出可借鉴的机制/方法/表征，或说明不建议精读。"
+                "不要只概括文献内容，也不要只写它和分类体系的关系。"
+            )
+        field_lines.append(f"{field}：{description}".rstrip("："))
     classification_lines = ["", classification_context] if classification_context else []
     return "\n".join(
         [
@@ -121,6 +166,9 @@ def build_ai_user_prompt(
             f"关键词：{record_payload['keywords']}",
             f"摘要：{record_payload['abstract']}",
             *classification_lines,
+            "",
+            f"当前研究主题：{topic}",
+            f"关键要求：research_topic_connection 必须直接回答这篇文献和“{topic}”的关系。分类失败或分类字段为 AI未分类 时，也必须按这个研究主题判断，不能退化成摘要复述。",
             "",
             user_prompt,
             "",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -24,8 +25,11 @@ DEFAULT_GROUP_MAX_TOKENS = 6000
 DEFAULT_GROUP_BATCH_SIZE = 25
 DEFAULT_GROUP_MAX_INPUT_CHARS = 60000
 DEFAULT_GROUP_RECORD_ABSTRACT_CHARS = 300
-DEFAULT_GROUP_MAX_TAXONOMY_ITEMS = 40
+DEFAULT_GROUP_MAX_TAXONOMY_ITEMS = 60
 DEFAULT_GROUP_MERGE_SIZE = 8
+DEFAULT_CLASSIFICATION_CONTEXT_DESCRIPTION_CHARS = 28
+DEFAULT_CLASSIFICATION_CONTEXT_CANDIDATE_LIMIT = 20
+DEFAULT_CLASSIFICATION_CONTEXT_CANDIDATE_THRESHOLD = 120
 
 
 def prepare_classification_scheme(
@@ -49,6 +53,14 @@ def prepare_classification_scheme(
         if cached:
             print(f"已加载 AI 文献组分类体系：{len(cached.get('taxonomy', []))} 个分类")
             return cached
+        compatible_cached = load_compatible_classification_scheme(cache_records, records, fields, requested_fields)
+        if compatible_cached:
+            print(
+                "已加载兼容的 AI 文献组分类体系："
+                f"{len(compatible_cached.get('taxonomy', []))} 个分类。"
+                "如需按当前分类设置重建，请设置 LITERATURE_REFRESH_AI=1。"
+            )
+            return compatible_cached
 
     if not api_key or not use_ai:
         if api_key and not use_ai:
@@ -99,23 +111,56 @@ def save_classification_cache(cache: dict[str, Any]) -> None:
     GROUP_CLASSIFICATION_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def classification_cache_key(records: list[LiteratureRecord], fields: list[str]) -> str:
+def classification_cache_key(
+    records: list[LiteratureRecord],
+    fields: list[str],
+    settings: dict[str, Any] | None = None,
+) -> str:
     record_material = "\n\n".join(record_digest(record) for record in records)
-    material = "\n\n".join([classification_settings_signature(), template_signature(fields), record_material])
+    material = "\n\n".join([classification_settings_signature(settings), template_signature(fields), record_material])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def classification_settings_signature() -> str:
-    settings = {
-        "version": "group-classification-v2",
+def classification_settings(max_taxonomy_items: int | None = None) -> dict[str, Any]:
+    return {
+        "version": "group-classification-v3-chinese-taxonomy",
         "mode": os.getenv("LITERATURE_GROUP_MODE", "auto").strip().lower() or "auto",
         "batch_size": group_batch_size(),
         "max_input_chars": group_max_input_chars(),
         "record_abstract_chars": group_record_abstract_chars(),
-        "max_taxonomy_items": group_max_taxonomy_items(),
+        "max_taxonomy_items": max_taxonomy_items if max_taxonomy_items is not None else group_max_taxonomy_items(),
         "merge_size": group_merge_size(),
     }
+
+
+def classification_settings_signature(settings: dict[str, Any] | None = None) -> str:
+    settings = settings or classification_settings()
     return json.dumps(settings, ensure_ascii=False, sort_keys=True)
+
+
+def load_compatible_classification_scheme(
+    cache_records: dict[str, Any],
+    records: list[LiteratureRecord],
+    fields: list[str],
+    requested_fields: list[str],
+) -> dict[str, Any]:
+    for key in compatible_classification_cache_keys(records, fields):
+        cached = normalize_classification_scheme(cache_records.get(key), requested_fields)
+        if cached:
+            return cached
+    return {}
+
+
+def compatible_classification_cache_keys(records: list[LiteratureRecord], fields: list[str]) -> list[str]:
+    current_items = group_max_taxonomy_items()
+    candidate_item_limits = [30, 40, 50, 60, 80, 100]
+    keys: list[str] = []
+    for item_limit in candidate_item_limits:
+        if item_limit == current_items:
+            continue
+        settings = classification_settings(max_taxonomy_items=item_limit)
+        keys.append(classification_cache_key(records, fields, settings=settings))
+    return keys
 
 
 def record_digest(record: LiteratureRecord) -> str:
@@ -183,6 +228,66 @@ def group_max_taxonomy_items() -> int:
 
 def group_merge_size() -> int:
     return env_int("LITERATURE_GROUP_MERGE_SIZE", DEFAULT_GROUP_MERGE_SIZE, minimum=2)
+
+
+def group_json_thinking_enabled() -> bool:
+    return os.getenv("LITERATURE_GROUP_USE_THINKING", "").strip() == "1"
+
+
+def classification_context_description_chars() -> int:
+    return env_int(
+        "LITERATURE_CLASSIFICATION_CONTEXT_DESCRIPTION_CHARS",
+        DEFAULT_CLASSIFICATION_CONTEXT_DESCRIPTION_CHARS,
+        minimum=0,
+    )
+
+
+def classification_context_candidate_limit() -> int:
+    return env_int(
+        "LITERATURE_CLASSIFICATION_CONTEXT_CANDIDATE_LIMIT",
+        DEFAULT_CLASSIFICATION_CONTEXT_CANDIDATE_LIMIT,
+        minimum=1,
+    )
+
+
+def classification_context_candidate_threshold() -> int:
+    return env_int(
+        "LITERATURE_CLASSIFICATION_CONTEXT_CANDIDATE_THRESHOLD",
+        DEFAULT_CLASSIFICATION_CONTEXT_CANDIDATE_THRESHOLD,
+        minimum=1,
+    )
+
+
+def classification_context_mode() -> str:
+    mode = os.getenv("LITERATURE_CLASSIFICATION_CONTEXT_MODE", "compact").strip().lower()
+    if mode in {"compact", "full", "candidates", "candidate", "auto"}:
+        return mode
+    print(f"未知 LITERATURE_CLASSIFICATION_CONTEXT_MODE={mode}，已按 compact 处理。")
+    return "compact"
+
+
+def apply_group_json_reasoning_controls(payload: dict[str, Any], config: dict[str, Any]) -> None:
+    if group_json_thinking_enabled():
+        if config.get("thinking"):
+            payload["thinking"] = config["thinking"]
+        if config.get("reasoning_effort"):
+            payload["reasoning_effort"] = config["reasoning_effort"]
+        return
+
+    provider = str(config.get("provider", "")).lower()
+    if provider == "deepseek" and config.get("thinking"):
+        payload["thinking"] = {"type": "disabled"}
+
+
+def post_group_classification_json(endpoint: str, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return post_llm_json(endpoint, payload, config)
+    except RuntimeError as exc:
+        if "thinking" not in str(exc).lower():
+            raise
+        retry_payload = dict(payload)
+        retry_payload.pop("thinking", None)
+        return post_llm_json(endpoint, retry_payload, config)
 
 
 def annotate_large_group_classification(
@@ -349,12 +454,9 @@ def annotate_group_with_chat_completions(
     }
     if config.get("json_mode", True):
         payload["response_format"] = {"type": "json_object"}
-    if config.get("thinking"):
-        payload["thinking"] = config["thinking"]
-    if config.get("reasoning_effort"):
-        payload["reasoning_effort"] = config["reasoning_effort"]
+    apply_group_json_reasoning_controls(payload, config)
 
-    data = post_llm_json(endpoint, payload, config)
+    data = post_group_classification_json(endpoint, payload, config)
     content = chat_message_text(data)
     try:
         return parse_classification_response(content, fields)
@@ -407,9 +509,9 @@ def annotate_group_with_anthropic_messages(
         "temperature": float(config.get("temperature", 0.2)),
         "max_tokens": group_max_tokens(config),
     }
-    if config.get("thinking"):
+    if group_json_thinking_enabled() and config.get("thinking"):
         payload["thinking"] = config["thinking"]
-    data = post_llm_json(endpoint, payload, config)
+    data = post_group_classification_json(endpoint, payload, config)
     content = "\n".join(item.get("text", "") for item in data.get("content", []) if item.get("type") == "text")
     try:
         return parse_classification_response(content, fields)
@@ -452,7 +554,7 @@ def retry_group_classification_json(
     previous_error: Exception,
 ) -> dict[str, Any]:
     retry_payload = dict(payload)
-    retry_payload.pop("thinking", None)
+    apply_group_json_reasoning_controls(retry_payload, config)
     retry_payload.pop("reasoning_effort", None)
     retry_payload["max_tokens"] = group_max_tokens(config)
     retry_payload["messages"] = [
@@ -465,7 +567,7 @@ def retry_group_classification_json(
             "content": build_group_classification_retry_prompt(source_prompt, fields, previous_text, previous_error),
         },
     ]
-    data = post_llm_json(endpoint, retry_payload, config)
+    data = post_group_classification_json(endpoint, retry_payload, config)
     content = chat_message_text(data)
     try:
         return parse_classification_response(content, fields)
@@ -482,7 +584,7 @@ def build_group_classification_instructions() -> str:
             review_prompt,
             summary_prompt,
             "你需要先根据当前研究主题和整组文献自动归纳分类体系。",
-            "分类名称必须来自你对这批文献的理解，不要沿用任何预设材料体系或工艺类别。",
+            "分类名称必须来自你对这批文献和当前研究主题的理解，不要沿用任何预设领域体系或固定类别。",
             "输出必须是合法 JSON 对象，不要输出 Markdown 或解释文字。",
         ]
     )
@@ -511,9 +613,11 @@ def build_group_classification_prompt_from_indexed_records(
             "要求：",
             "1. 只能根据当前研究主题和这组文献本身归纳分类，不要使用 Python 规则或固定关键词分类。",
             "2. 分类体系要能覆盖这组文献中的主要研究脉络。",
-            "3. 分类名称要适合后续写入 broad_direction、medium_direction、small_direction 等字段。",
-            "4. taxonomy 中每个分类都要给出 description，帮助后续逐篇文献归类。",
-            "5. 如果 small_direction 不在输出字段中，也可以省略或留空。",
+            "3. broad_direction、medium_direction、small_direction 的分类名称必须使用中文短语，不要使用英文分类名。",
+            "4. 分类名称要适合后续写入 broad_direction、medium_direction、small_direction 等字段。",
+            f"5. 全局 taxonomy 目标控制在 {group_max_taxonomy_items()} 个叶子分类以内；相近分类必须合并，不要为少量文献单独造类。",
+            "6. taxonomy 中每个分类都要给出简短中文 description，帮助后续逐篇文献归类。",
+            "7. 如果 small_direction 不在输出字段中，也可以省略或留空。",
             "",
             "请输出 JSON：",
             json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
@@ -543,14 +647,16 @@ def build_merge_classification_prompt(schemes: list[dict[str, Any]], fields: lis
         [
             "下面是若干批文献已经生成的局部分类体系。请将它们合并成一个全局分类体系，供后续所有文献逐篇标注使用。",
             f"分类字段：{field_text}",
-            f"全局 taxonomy 建议不超过 {group_max_taxonomy_items()} 个叶子分类；如果局部分类语义相近，请合并并统一命名。",
+            f"全局 taxonomy 目标不超过 {group_max_taxonomy_items()} 个叶子分类；如果局部分类语义相近，请合并并统一命名。",
+            "合并后的 broad_direction、medium_direction、small_direction 必须全部改写为中文分类名；不要保留英文分类名称。",
             "",
             "合并要求：",
-            "1. 只合并分类体系，不要重新发明与材料无关的新分类。",
+            "1. 只合并分类体系，不要重新发明与当前研究主题和文献证据无关的新分类。",
             "2. 保留能覆盖主要研究脉络的 broad_direction、medium_direction、small_direction 层级。",
-            "3. description 要说明该分类适合归入哪些文献，便于后续逐篇选择。",
-            "4. representative_indices 合并各局部分类中的代表文献序号，保留少量最有代表性的序号即可。",
-            "5. 输出必须是一个合法 JSON 对象，不要输出 Markdown 或解释文字。",
+            "3. 分类名称必须是来自当前研究主题和当前文献的中文短语，不要输出英文标题，也不要沿用其他主题的示例词。",
+            "4. description 要用简短中文说明该分类适合归入哪些文献，便于后续逐篇选择。",
+            "5. representative_indices 合并各局部分类中的代表文献序号，保留少量最有代表性的序号即可；不要因为单个序号而新建过细分类。",
+            "6. 输出必须是一个合法 JSON 对象，不要输出 Markdown 或解释文字。",
             "",
             "请输出 JSON：",
             json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
@@ -582,7 +688,7 @@ def build_group_classification_retry_prompt(
             "JSON 结构必须完全类似：",
             json.dumps({"taxonomy": [example_fields]}, ensure_ascii=False),
             "",
-            "原始任务和材料如下：",
+            "原始任务和文献材料如下：",
             source_prompt,
         ]
     )
@@ -685,23 +791,145 @@ def normalize_classification_scheme(value: Any, requested_fields: list[str]) -> 
     return {"taxonomy": normalized_items}
 
 
-def format_classification_scheme(scheme: dict[str, Any], fields: list[str]) -> str:
+def compact_classification_items(scheme: dict[str, Any], fields: list[str]) -> list[dict[str, str]]:
     taxonomy = scheme.get("taxonomy", []) if isinstance(scheme, dict) else []
-    if not taxonomy:
+    requested_fields = classification_fields(fields)
+    description_limit = classification_context_description_chars()
+    compact_items: list[dict[str, str]] = []
+    seen_paths: set[tuple[str, ...]] = set()
+
+    for item in taxonomy:
+        if not isinstance(item, dict):
+            continue
+        compact_item: dict[str, str] = {}
+        for field in requested_fields:
+            value = clean_spaces(str(item.get(field, "")))
+            compact_item[field] = value
+
+        path_key = tuple(compact_item.get(field, "") for field in requested_fields)
+        if not any(path_key) or path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+
+        description = clean_spaces(str(item.get("description", "")))
+        if description_limit <= 0:
+            description = ""
+        elif description:
+            description = truncate(description, description_limit)
+        compact_item["description"] = description
+        compact_items.append(compact_item)
+
+    return compact_items
+
+
+def format_classification_scheme(
+    scheme: dict[str, Any],
+    fields: list[str],
+    record: LiteratureRecord | None = None,
+) -> str:
+    compact_items = compact_classification_items(scheme, fields)
+    if not compact_items:
         return ""
 
-    lines = [
-        "当前文献组已经由 AI 根据研究主题生成如下分类体系。",
-        "逐篇文献输出分类字段时，应优先从该体系中选择最合适的一组分类；只有确实不匹配时才使用“AI未分类/待AI复核”。",
-    ]
+    mode = classification_context_mode()
+    use_candidates = record is not None and mode in {"candidates", "candidate"}
+    use_candidates = use_candidates or (
+        record is not None
+        and mode == "auto"
+        and len(compact_items) > classification_context_candidate_threshold()
+    )
+    selected_items = (
+        select_candidate_classifications(record, compact_items, fields, classification_context_candidate_limit())
+        if use_candidates and record is not None
+        else compact_items
+    )
+
     requested_fields = classification_fields(fields)
-    for index, item in enumerate(taxonomy, start=1):
-        parts = [f"{field}={item.get(field, '')}" for field in requested_fields if item.get(field, "")]
-        description = item.get("description", "")
-        if description:
-            parts.append(f"description={description}")
-        lines.append(f"{index}. " + "；".join(parts))
+    lines = [
+        "当前文献组分类体系如下，已压缩为分类路径和简短说明。",
+        "逐篇文献输出分类字段时，优先从这些中文分类中选择；确实不匹配时才使用“AI未分类/待AI复核”。",
+        "分类路径格式为 broad_direction > medium_direction > small_direction。",
+    ]
+
+    if use_candidates:
+        lines.extend(
+            [
+                "当前仅列出与这篇文献最相关的候选叶子分类，并保留上级分类概览；不要新增英文分类名。",
+                "可用上级分类概览：",
+                *format_classification_overview(compact_items, requested_fields),
+                "候选叶子分类：",
+            ]
+        )
+    else:
+        lines.append("分类字段 broad_direction、medium_direction、small_direction 必须输出中文分类名；不要新增英文分类名。")
+
+    for index, item in enumerate(selected_items, start=1):
+        lines.append(format_compact_classification_item(index, item, requested_fields))
     return "\n".join(lines)
+
+
+def format_compact_classification_item(index: int, item: dict[str, str], requested_fields: list[str]) -> str:
+    path = " > ".join(item.get(field, "") for field in requested_fields if item.get(field, ""))
+    description = item.get("description", "")
+    if description:
+        return f"{index}. {path}；说明：{description}"
+    return f"{index}. {path}"
+
+
+def format_classification_overview(items: list[dict[str, str]], requested_fields: list[str]) -> list[str]:
+    overview_fields = requested_fields[:2] if len(requested_fields) > 1 else requested_fields[:1]
+    if not overview_fields:
+        return []
+
+    seen: set[tuple[str, ...]] = set()
+    lines: list[str] = []
+    for item in items:
+        path = tuple(item.get(field, "") for field in overview_fields)
+        if not any(path) or path in seen:
+            continue
+        seen.add(path)
+        lines.append("- " + " > ".join(part for part in path if part))
+    return lines
+
+
+def select_candidate_classifications(
+    record: LiteratureRecord,
+    items: list[dict[str, str]],
+    fields: list[str],
+    limit: int,
+) -> list[dict[str, str]]:
+    record_text = "\n".join(
+        [
+            record.title,
+            record.journal,
+            "; ".join(record.keywords),
+            truncate(record.abstract, 1200),
+        ]
+    )
+    record_units = text_match_units(record_text)
+    requested_fields = classification_fields(fields)
+    scored: list[tuple[int, int, dict[str, str]]] = []
+    for index, item in enumerate(items):
+        item_text = " ".join([*(item.get(field, "") for field in requested_fields), item.get("description", "")])
+        item_units = text_match_units(item_text)
+        score = len(record_units & item_units)
+        scored.append((score, -index, item))
+
+    scored.sort(reverse=True)
+    selected = [item for _score, _negative_index, item in scored[:limit]]
+    return selected or items[:limit]
+
+
+def text_match_units(text: str) -> set[str]:
+    text = clean_spaces(text).casefold()
+    if not text:
+        return set()
+
+    units = set(re.findall(r"[a-z0-9][a-z0-9_+-]{1,}", text))
+    cjk_chars = [char for char in text if "\u4e00" <= char <= "\u9fff"]
+    units.update("".join(cjk_chars[index : index + 2]) for index in range(max(0, len(cjk_chars) - 1)))
+    units.update("".join(cjk_chars[index : index + 3]) for index in range(max(0, len(cjk_chars) - 2)))
+    return {unit for unit in units if unit.strip()}
 
 
 def classification_scheme_signature(scheme: dict[str, Any]) -> str:
